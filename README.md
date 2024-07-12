@@ -1,5 +1,5 @@
 # MSFSNet_
-Multi-Scale Frequency Selection Network for Image Restoration
+Exploring Richer and More Accurate Information via Frequency Selection for Image Restoration
 
 
 ### Evaluation
