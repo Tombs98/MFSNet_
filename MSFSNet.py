@@ -13,11 +13,35 @@ class SFF(nn.Module):
         self.height = height
         d = max(int(in_channels/reduction),4)
         
-        # Our code will be released after the paper is published
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.conv_du = nn.Sequential(nn.Conv2d(in_channels, d, 1, padding=0, bias=bias),SimpleGate())
+
+        self.fcs = nn.ModuleList([])
+        for i in range(self.height):
+            self.fcs.append(nn.Conv2d(d//2, in_channels, kernel_size=1, stride=1,bias=bias))
+        
+        self.softmax = nn.Softmax(dim=1)
+
+        self.conv1 = nn.Conv2d(in_channels*4,in_channels,1)
+        self.conv2 = nn.Sequential(
+                    nn.Conv2d(in_channels*2, in_channels * 4, 1, bias=False),
+                    nn.PixelShuffle(2)
+                )
 
     def forward(self, f_r, f_m):
 
+        f_m = self.conv2(f_m)
+        f_r = self.conv1(f_r)
+        feats_U = f_r + f_m
+        feats_S = self.avg_pool(feats_U)
+        feats_Z = self.conv_du(feats_S)
+
+        a_r = self.softmax(self.fcs[0](feats_Z))
+        a_m = self.softmax(self.fcs[1](feats_Z))
+      
         
+        m = f_m * a_m + f_m
+        r = f_r * a_r + f_r + m
         
         return r, m
 
@@ -133,30 +157,59 @@ class SFE(nn.Module):
         return x
     
 
-class dynamic_filter(nn.Module):
+class dfs(nn.Module):
     def __init__(self, inchannels, kernel_size=3, stride=1, group=8):
-        super(dynamic_filter, self).__init__()
+        super(dfs, self).__init__()
         self.stride = stride
         self.kernel_size = kernel_size
         self.group = group
 
-      # Our code will be released after the paper is published
+        self.lamb_l = nn.Parameter(torch.zeros(inchannels), requires_grad=True)
+        self.lamb_h = nn.Parameter(torch.zeros(inchannels), requires_grad=True)
+
+        self.conv = nn.Conv2d(inchannels, group*kernel_size**2, kernel_size=1, stride=1, bias=False)
+        self.ln = LayerNorm2d(group*kernel_size**2)
+        self.act = nn.Softmax(dim=-2)
+        nn.init.kaiming_normal_(self.conv.weight, mode='fan_out', nonlinearity='relu')
+
+        self.pad = nn.ReflectionPad2d(kernel_size//2)
+
+        self.ap = nn.AdaptiveAvgPool2d((1, 1))
         self.modulate = FCAM(inchannels)
 
     def forward(self, x):
         identity_input = x 
-       
+        low_filter = self.ap(x)
+        low_filter = self.conv(low_filter)
+        low_filter = self.ln(low_filter)     
+
+        n, c, h, w = x.shape  
+        x = F.unfold(self.pad(x), kernel_size=self.kernel_size).reshape(n, self.group, c//self.group, self.kernel_size**2, h*w)
+
+        n,c1,p,q = low_filter.shape
+        low_filter = low_filter.reshape(n, c1//self.kernel_size**2, self.kernel_size**2, p*q).unsqueeze(2)
+        low_filter = self.act(low_filter)
+        low_part = torch.sum(x * low_filter, dim=3).reshape(n, c, h, w)
+
+        out_high = identity_input - low_part
+        out = self.modulate(low_part, out_high)
         return out
 
 class FCAM(nn.Module):
-    '''
-    Frequency Cross Attention Module (FCAM)
-    '''
     def __init__(self, c):
         super().__init__()
         self.scale = c ** -0.5
 
-      # Our code will be released after the paper is published
+        self.norm_l = LayerNorm2d(c)
+        self.norm_r = LayerNorm2d(c)
+        self.l_proj1 = nn.Conv2d(c, c, kernel_size=1, stride=1, padding=0)
+        self.r_proj1 = nn.Conv2d(c, c, kernel_size=1, stride=1, padding=0)
+        
+        self.beta = nn.Parameter(torch.zeros((1, c, 1, 1)), requires_grad=True)
+        self.gamma = nn.Parameter(torch.zeros((1, c, 1, 1)), requires_grad=True)
+
+        self.l_proj2 = nn.Conv2d(c, c, kernel_size=1, stride=1, padding=0)
+        self.r_proj2 = nn.Conv2d(c, c, kernel_size=1, stride=1, padding=0)
 
     def forward(self, x_l, x_h):
         Q_l = self.l_proj1(self.norm_l(x_l)).permute(0, 2, 3, 1)  # B, H, W, c
@@ -187,8 +240,8 @@ class MD(nn.Module):
 
         self.project_in = nn.Conv2d(in_channel, in_channel, kernel_size=1)
        
-        self.dyna = dynamic_filter(in_channel//2) 
-        self.dyna_2 = dynamic_filter(in_channel//2, kernel_size=5) 
+        self.dyna = dfs(in_channel//2) 
+        self.dyna_2 = dfs(in_channel//2, kernel_size=5) 
         self.project_out = nn.Conv2d(in_channel, in_channel, kernel_size=1)
 
     def forward(self, x):
